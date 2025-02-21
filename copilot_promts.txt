@@ -1,0 +1,4 @@
+write a multitasked ad9850 controller that: gets triggered by a rising edge interrupt on pin COSTAS_TRIG_PIN, When triggered, calculates a 40 bit word from the ad9850 based on a 7-element array with the values of a costas sequence and a few parameters that were #define'd, On interrupt at pin COSTAS_CLK_PIN, asserts COSTAS_TXRQ_PIN, loads the ad9850 with that word and waits until a posedge interrupt happens on FQ_UD_PIN, then deasserts COSTAS_TXRQ_PIN and waits until next trigger on COSTAS_CLK_PIN and loads the next word.
+Once all words have been loaded and the last FQ_UD_PIN interrupt was recieved, loads ad9850 with an empty word, and waits for the next COSTAS_TRIG_PIN interrupt.
+Write the bit by bit loader too. Use DDS_DATA_PIN and DDS_CLK_PIN as the data and clock pins of the ad9850.
+This has to be an rtos task. It's fine if it's broken down into multiple.
