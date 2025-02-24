@@ -17,8 +17,8 @@
 #define DDS_RST D11
 // Constants for frequency calculation
 #define BASEBAND_FREQ 6000000ULL  // 6 MHz
-#define FREQ_OFFSET 300000ULL       // 30 kHz offset
-#define FREQ_STEP 30000ULL          // 30 kHz step
+#define FREQ_OFFSET 1000ULL       // 30 kHz offset
+#define FREQ_STEP 100ULL          // 30 kHz step
 
 // Globals for sequence control
 volatile uint8_t currentIndex = 0;
@@ -29,6 +29,7 @@ volatile bool PSKSequenceActive = false;
 char PSKData[sizeof(BEACON_ID_MSG) + 1];
 volatile uint64_t bitWord[2];
 volatile bool wordLoaded = false;
+volatile bool waitingForFqud = false;
 volatile uint64_t currentWord = 0;
 
 // Prototypes
@@ -41,6 +42,8 @@ void IRAM_ATTR fqudISR();
 
 
 // Task handles
+static const UBaseType_t adLoaderPriority = 3;  // High priority for timing-critical AD9850 loading
+static const UBaseType_t sequencePriority = 2;  // Medium priority for sequence handling
 TaskHandle_t adLoaderTaskCostasHandle = NULL;
 TaskHandle_t sequenceTask = NULL;
 TaskHandle_t adLoaderTaskPSKHandle = NULL;
@@ -72,9 +75,7 @@ uint64_t calculateFreqPhase(uint32_t freq, uint16_t phaseDegree) {
 void loadAD9850Word(uint64_t word) {
   for(int i = 0; i < 40; i++) {
     digitalWrite(DDS_DATA_PIN, (word >> i) & 1);
-    vTaskDelay(1);
     digitalWrite(DDS_CLK_PIN, HIGH);
-    vTaskDelay(1);
     digitalWrite(DDS_CLK_PIN, LOW);
   }
 }
@@ -82,6 +83,11 @@ void loadAD9850Word(uint64_t word) {
 // Sequence handler task
 void sequenceHandlerTask(void * parameter) {
   for(;;) {
+    if(waitingForFqud) {
+      // Wait for final FQ_UD rising edge
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      waitingForFqud = false;
+    } else {
     if(CostasSequenceActive && !wordLoaded) {
       currentWord = calculateAD9850WordCostas(currentIndex);
       wordLoaded = true;
@@ -96,18 +102,20 @@ void sequenceHandlerTask(void * parameter) {
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     } else if(PSKPreambleActive && !wordLoaded) {
       preambleCounter++;
+      currentWord = bitWord[0];
+      loadAD9850Word(currentWord);
+      digitalWrite(DDS_CLK_PIN, HIGH);
+      digitalWrite(DDS_CLK_PIN, LOW);
       if(preambleCounter > 7) {
         PSKPreambleActive = false;
         preambleCounter = 0;
-      } else {
-      // Load the word
-      currentWord = bitWord[0];
-      wordLoaded = true;
+        PSKSequenceActive = true;
       }
-      // Wait for next clock trigger
+      // Wait for next fq_ud rising edge
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    } 
     }
-    vTaskDelay(1); // Yield to other tasks
+    vTaskDelay(1);
   }
 }
 
@@ -119,19 +127,21 @@ void adLoaderTaskCostas(void * parameter) {
           loadAD9850Word(currentWord);
           // Wait for FQ_UD rising edge
           ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-          
           wordLoaded = false;
           if(++currentIndex >= COSTAS_SEQ_LEN+1) { // +1 for initialization
             if(!waitingForFinalFqud) {
+              waitingForFqud = true;
               waitingForFinalFqud = true;
               currentIndex--;                     // Keep current index valid for one more cycle (to let the last frequency play)
             } else {
               currentIndex = 0;
               CostasSequenceActive = false;
-              digitalWrite(COSTAS_TXRQ_PIN, LOW);
               digitalWrite(DDS_RST, HIGH);        // Reset AD9850
-              vTaskDelay(500);                    // Give it some time to get cozy and fall asleep
+              vTaskDelay(2000);                    // Give it some time to get cozy and fall asleep
               digitalWrite(DDS_RST, LOW);         // Deassert reset
+              vTaskDelay(1);                    // Let a few more cycles pass
+              digitalWrite(COSTAS_TXRQ_PIN, LOW);
+              wordLoaded = false;
               waitingForFinalFqud = false;
             }
           }
@@ -147,21 +157,23 @@ void adLoaderTaskPSK(void * parameter) {
       loadAD9850Word(currentWord);
       // Wait for FQ_UD rising edge
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-      
       wordLoaded = false;
       if(PSKSequenceActive)
       if(++currentIndex >= 8 * (uint32_t)strlen(BEACON_ID_MSG) + 1) { // +1 for initialization
         if(!waitingForFinalFqud) {
+          waitingForFqud = true;
           waitingForFinalFqud = true;
           currentIndex--;                     // Keep current index valid for one more cycle (to let the last frequency play)
         } else {
-          currentIndex = 0;
           PSKSequenceActive = false;
-          digitalWrite(PSK_TXRQ_PIN, LOW);
+          currentIndex = 0;
           digitalWrite(DDS_RST, HIGH);        // Reset AD9850
-          vTaskDelay(500);                    // Give it some time to get cozy and fall asleep
+          vTaskDelay(2000);                    // Give it some time to get cozy and fall asleep
           digitalWrite(DDS_RST, LOW);         // Deassert reset
+          vTaskDelay(1);                    // Let a few more cycles pass
+          digitalWrite(PSK_TXRQ_PIN, LOW);
           waitingForFinalFqud = false;
+          wordLoaded = false;
         }
       }
     }
@@ -187,6 +199,7 @@ void IRAM_ATTR clockISRCostas() {
   vTaskNotifyGiveFromISR(sequenceTask, &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
+
 void IRAM_ATTR clockISRPSK() {
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   vTaskNotifyGiveFromISR(sequenceTask, &xHigherPriorityTaskWoken);
@@ -198,7 +211,6 @@ void IRAM_ATTR fqudISR() {
   if(CostasSequenceActive){
     vTaskNotifyGiveFromISR(adLoaderTaskCostasHandle, &xHigherPriorityTaskWoken);
   }
-  else
   if(PSKSequenceActive || PSKPreambleActive){
     vTaskNotifyGiveFromISR(adLoaderTaskPSKHandle, &xHigherPriorityTaskWoken);
   }
@@ -220,6 +232,9 @@ void setup() {
   pinMode(DDS_DATA_PIN, OUTPUT);
   pinMode(DDS_CLK_PIN, OUTPUT);
   pinMode(DDS_RST, OUTPUT);
+  pinMode(PSK_TXRQ_PIN, OUTPUT);
+  pinMode(PSK_CLK_PIN, INPUT);
+  pinMode(PSK_TRIG_PIN, INPUT);
 
   // Create tasks
   xTaskCreatePinnedToCore(
@@ -227,7 +242,7 @@ void setup() {
     "sequenceHandler",
     10000,
     NULL,
-    2,
+    1,
     &sequenceTask,
     0
   );
@@ -237,7 +252,7 @@ void setup() {
     "adLoaderCostas",
     10000,
     NULL,
-    1,
+    2,
     &adLoaderTaskCostasHandle,
     0
   );
@@ -247,7 +262,7 @@ void setup() {
     "adLoaderPSK",
     10000,
     NULL,
-    1,
+    2,
     &adLoaderTaskPSKHandle,
     0
   );
